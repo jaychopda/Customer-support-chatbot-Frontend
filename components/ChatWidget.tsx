@@ -1,56 +1,173 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { socket } from "../lib/socket";
+
+type ChatStatus = "ACTIVE" | "CLOSED" | "IDLE";
 
 interface Message {
   content: string;
   sender: "USER" | "ADMIN";
 }
 
+const API_BASE = "http://localhost:5000";
+const CHAT_COOKIE = "chat_session_id";
+
+const readCookie = (key: string) => {
+  if (typeof document === "undefined") return null;
+  return document.cookie
+    .split(";")
+    .map((c) => c.trim())
+    .find((c) => c.startsWith(`${key}=`))
+    ?.split("=")[1] || null;
+};
+
+const writeCookie = (key: string, value: string, days = 30) => {
+  if (typeof document === "undefined") return;
+  const expires = new Date();
+  expires.setDate(expires.getDate() + days);
+  document.cookie = `${key}=${value}; expires=${expires.toUTCString()}; path=/; SameSite=Lax`;
+};
+
+const clearCookie = (key: string) => {
+  if (typeof document === "undefined") return;
+  document.cookie = `${key}=; expires=Thu, 01 Jan 1970 00:00:00 UTC; path=/; SameSite=Lax`;
+};
+
 export default function ChatWidget() {
   const [open, setOpen] = useState(false);
-  const [status, setStatus] = useState<"connecting" | "online" | "offline">(
-    "connecting",
-  );
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   const [chatId, setChatId] = useState<string | null>(null);
+  const [status, setStatus] = useState<"online" | "offline">("offline");
+  const [chatStatus, setChatStatus] = useState<ChatStatus>("IDLE");
+  const [userName, setUserName] = useState("");
+  const [nameDraft, setNameDraft] = useState("");
+  const [loading, setLoading] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
 
+  /* ---------------- RESTORE SESSION ---------------- */
   useEffect(() => {
-    const handleConnect = () => setStatus("online");
-    const handleDisconnect = () => setStatus("offline");
-    socket.on("connect", handleConnect);
-    socket.on("disconnect", handleDisconnect);
-    setStatus(socket.connected ? "online" : "connecting");
+    const existingId = readCookie(CHAT_COOKIE);
+    if (existingId) {
+      restoreChat(existingId);
+    }
+  }, []);
 
-    socket.on("receive-message", (data) => {
-      setChatId(data.chatId);
-      setMessages((prev) => [...prev, data.message]);
-    });
+  /* ---------------- SOCKET ---------------- */
+  useEffect(() => {
+    socket.on("connect", () => setStatus("online"));
+    socket.on("disconnect", () => setStatus("offline"));
 
     return () => {
-      socket.off("connect", handleConnect);
-      socket.off("disconnect", handleDisconnect);
-      socket.off("receive-message");
+      socket.off("connect");
+      socket.off("disconnect");
     };
   }, []);
 
   useEffect(() => {
-    const handleExternalOpen = () => setOpen(true);
-    window.addEventListener("chat:open", handleExternalOpen);
-    return () => window.removeEventListener("chat:open", handleExternalOpen);
-  }, []);
+    const handleReceive = (data: { chatId: string; message: Message }) => {
+      if (!chatId) {
+        setChatId(data.chatId);
+        writeCookie(CHAT_COOKIE, data.chatId);
+        socket.emit("join-chat", data.chatId);
+        setChatStatus("ACTIVE");
+      }
 
+      if (data.chatId !== chatId) return;
+
+      setMessages((prev) => {
+        const last = prev[prev.length - 1];
+        // Drop exact duplicate (same sender + content)
+        if (last && last.content === data.message.content && last.sender === data.message.sender) {
+          return prev;
+        }
+        return [...prev, data.message];
+      });
+    };
+
+    const handleClosed = () => setChatStatus("CLOSED");
+    const handleError = (payload: any) => console.warn("chat-error", payload);
+
+    // Ensure only one handler of each kind is attached
+    socket.off("receive-message");
+    socket.off("chat-closed");
+    socket.off("chat-error");
+
+    socket.on("receive-message", handleReceive);
+    socket.on("chat-closed", handleClosed);
+    socket.on("chat-error", handleError);
+
+    return () => {
+      socket.off("receive-message", handleReceive);
+      socket.off("chat-closed", handleClosed);
+      socket.off("chat-error", handleError);
+    };
+  }, [chatId]);
+
+  /* ---------------- AUTO SCROLL ---------------- */
   useEffect(() => {
     if (scrollRef.current) {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
     }
   }, [messages, open]);
 
+  const restoreChat = async (id: string) => {
+    setLoading(true);
+    try {
+      const res = await fetch(`${API_BASE}/chat/${id}`);
+      if (!res.ok) throw new Error("Chat not found");
+      const data = await res.json();
+      setChatId(data.chat.id);
+      setChatStatus(data.chat.status ?? "ACTIVE");
+      setUserName(data.chat.user?.name || "");
+      setMessages(data.messages || []);
+      writeCookie(CHAT_COOKIE, data.chat.id);
+      socket.emit("join-chat", data.chat.id);
+    } catch (err) {
+      console.error(err);
+      clearCookie(CHAT_COOKIE);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const startChat = async () => {
+    if (!nameDraft.trim()) return;
+    setLoading(true);
+    try {
+      const res = await fetch(`${API_BASE}/chat/start`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: nameDraft }),
+      });
+
+      const data = await res.json();
+      const newId = data?.chat?.id;
+      if (!newId) throw new Error("Unable to start chat");
+
+      setChatId(newId);
+      setUserName(nameDraft);
+      setChatStatus("ACTIVE");
+      setMessages([]);
+      writeCookie(CHAT_COOKIE, newId);
+      socket.emit("join-chat", newId);
+      setNameDraft("");
+    } catch (err) {
+      console.error(err);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  /* ---------------- SEND MESSAGE ---------------- */
   const sendMessage = () => {
     if (!input.trim()) return;
+    if (!chatId) {
+      setOpen(true);
+      setChatStatus("IDLE");
+      return;
+    }
 
     socket.emit("send-message", {
       chatId,
@@ -61,386 +178,260 @@ export default function ChatWidget() {
     setInput("");
   };
 
-  const statusLabel = useMemo(() => {
-    if (status === "online") return "Online";
-    if (status === "connecting") return "Connecting";
-    return "Offline";
-  }, [status]);
+  const closeChat = async () => {
+    if (!chatId) return;
+    await fetch(`${API_BASE}/chat/${chatId}/close`, { method: "POST" });
+    setChatStatus("CLOSED" as ChatStatus);
+  };
 
-  const statusColor = useMemo(() => {
-    if (status === "online") return "#16a34a";
-    if (status === "connecting") return "#f59e0b";
-    return "#ef4444";
-  }, [status]);
+  const startNewChat = () => {
+    clearCookie(CHAT_COOKIE);
+    setChatId(null);
+    setMessages([]);
+    setChatStatus("IDLE" as ChatStatus);
+    setUserName("");
+    setOpen(true);
+  };
 
-  const quickReplies = [
-    "I need help with an order",
-    "Can I talk to a human?",
-    "What are your support hours?",
-  ];
+  const showNameGate = chatStatus === "IDLE" || !chatId;
+  const isClosed = chatStatus === "CLOSED";
+  const isActive = chatStatus === "ACTIVE";
 
   return (
     <>
       <button
-        aria-label={open ? "Close support chat" : "Open support chat"}
-        className="chat-toggle"
         onClick={() => setOpen(!open)}
+        style={{
+          position: "fixed",
+          bottom: 20,
+          right: 20,
+          width: 60,
+          height: 60,
+          borderRadius: "50%",
+          background: "#2563eb",
+          color: "#ffffff",
+          fontSize: 24,
+          border: "none",
+          cursor: "pointer",
+          boxShadow: "0 8px 25px rgba(0,0,0,0.3)",
+        }}
       >
         {open ? "×" : "💬"}
       </button>
 
       {open && (
-        <div className="chat-panel">
-          <header className="chat-header">
-            <div className="chat-identity">
-              <div className="avatar">CS</div>
-              <div>
-                <div className="title">Customer Support</div>
-                <div className="status" style={{ color: statusColor }}>
-                  <span className="status-dot" style={{ background: statusColor }} />
-                  {statusLabel}
-                </div>
-              </div>
+        <div
+          style={{
+            position: "fixed",
+            bottom: 90,
+            right: 20,
+            width: 360,
+            height: 500,
+            background: "#ffffff",
+            borderRadius: 12,
+            display: "flex",
+            flexDirection: "column",
+            boxShadow: "0 15px 45px rgba(0,0,0,0.35)",
+            overflow: "hidden",
+            fontFamily: "Arial, sans-serif",
+          }}
+        >
+          <div
+            style={{
+              padding: "12px 14px",
+              background: "#1e40af",
+              color: "#ffffff",
+              fontSize: 15,
+              fontWeight: 600,
+              display: "flex",
+              justifyContent: "space-between",
+              alignItems: "center",
+            }}
+          >
+            <span>Customer Support ({status})</span>
+            <div style={{ display: "flex", gap: 8 }}>
+              {isActive && (
+                <button
+                  onClick={closeChat}
+                  style={{
+                    fontSize: 12,
+                    background: "#0f172a",
+                    color: "#fff",
+                    border: "none",
+                    borderRadius: 6,
+                    padding: "6px 10px",
+                    cursor: "pointer",
+                  }}
+                >
+                  Close
+                </button>
+              )}
+              {isClosed && (
+                <button
+                  onClick={startNewChat}
+                  style={{
+                    fontSize: 12,
+                    background: "#22c55e",
+                    color: "#fff",
+                    border: "none",
+                    borderRadius: 6,
+                    padding: "6px 10px",
+                    cursor: "pointer",
+                  }}
+                >
+                  New Chat
+                </button>
+              )}
             </div>
-            <button className="icon-btn" onClick={() => setOpen(false)}>
-              ×
-            </button>
-          </header>
-
-          <div className="message-area" ref={scrollRef}>
-            {messages.length === 0 && (
-              <div className="empty-state">
-                <div className="empty-title">How can we help?</div>
-                <p className="empty-body">
-                  Send us a message and a specialist will jump in.
-                </p>
-              </div>
-            )}
-
-            {messages.map((msg, i) => (
-              <div
-                key={`${msg.content}-${i}`}
-                className={
-                  msg.sender === "USER" ? "bubble bubble-user" : "bubble bubble-admin"
-                }
-              >
-                {msg.content}
-              </div>
-            ))}
           </div>
 
-          <div className="quick-replies">
-            {quickReplies.map((label) => (
+          {showNameGate ? (
+            <div style={{ padding: 20, display: "flex", flexDirection: "column", gap: 12 }}>
+              <h4 style={{ margin: 0 }}>Welcome! Tell us your name</h4>
+              <input
+                value={nameDraft}
+                onChange={(e) => setNameDraft(e.target.value)}
+                placeholder="Your name"
+                style={{
+                  padding: "10px 12px",
+                  border: "1px solid #d1d5db",
+                  borderRadius: 8,
+                }}
+                disabled={loading}
+              />
               <button
-                key={label}
-                className="chip"
-                onClick={() => setInput(label)}
+                onClick={startChat}
+                style={{
+                  padding: "10px 12px",
+                  background: "#2563eb",
+                  color: "#fff",
+                  border: "none",
+                  borderRadius: 8,
+                  cursor: "pointer",
+                  fontWeight: 600,
+                }}
+                disabled={loading || !nameDraft.trim()}
               >
-                {label}
+                {loading ? "Starting..." : "Start chat"}
               </button>
-            ))}
-          </div>
+            </div>
+          ) : isClosed ? (
+            <div style={{ padding: 20, textAlign: "center" }}>
+              <p style={{ marginBottom: 12 }}>This chat is closed.</p>
+              <button
+                onClick={startNewChat}
+                style={{
+                  padding: "10px 12px",
+                  background: "#22c55e",
+                  color: "#fff",
+                  border: "none",
+                  borderRadius: 8,
+                  cursor: "pointer",
+                  fontWeight: 600,
+                }}
+              >
+                Start new chat
+              </button>
+            </div>
+          ) : (
+            <>
+              <div
+                ref={scrollRef}
+                style={{
+                  flex: 1,
+                  padding: 12,
+                  overflowY: "auto",
+                  background: "#f3f4f6",
+                }}
+              >
+                {messages.length === 0 && !loading && (
+                  <div
+                    style={{
+                      textAlign: "center",
+                      color: "#6b7280",
+                      marginTop: 40,
+                      fontSize: 14,
+                    }}
+                  >
+                    👋 {userName ? `${userName}, ` : ""}how can we help you today?
+                  </div>
+                )}
 
-          <div className="input-row">
-            <input
-              value={input}
-              onChange={(e) => setInput(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter" && !e.shiftKey) {
-                  e.preventDefault();
-                  sendMessage();
-                }
-              }}
-              placeholder={status === "offline" ? "Reconnecting..." : "Type a message"}
-              disabled={status === "offline"}
-            />
-            <button className="send-btn" onClick={sendMessage} disabled={status === "offline"}>
-              Send
-            </button>
-          </div>
+                {messages.map((msg, i) => (
+                  <div
+                    key={i}
+                    style={{
+                      display: "flex",
+                      justifyContent:
+                        msg.sender === "USER" ? "flex-end" : "flex-start",
+                      marginBottom: 8,
+                    }}
+                  >
+                    <div
+                      style={{
+                        maxWidth: "75%",
+                        padding: "8px 12px",
+                        borderRadius: 8,
+                        fontSize: 14,
+                        lineHeight: 1.4,
+                        background:
+                          msg.sender === "USER" ? "#2563eb" : "#e5e7eb",
+                        color:
+                          msg.sender === "USER" ? "#ffffff" : "#111827",
+                      }}
+                    >
+                      {msg.content}
+                    </div>
+                  </div>
+                ))}
+              </div>
+
+              <div
+                style={{
+                  padding: 10,
+                  display: "flex",
+                  gap: 8,
+                  borderTop: "1px solid #e5e7eb",
+                  background: "#ffffff",
+                }}
+              >
+                <input
+                  value={input}
+                  onChange={(e) => setInput(e.target.value)}
+                  onKeyDown={(e) => e.key === "Enter" && sendMessage()}
+                  placeholder={isClosed ? "Chat closed" : "Type a message..."}
+                  disabled={isClosed}
+                  style={{
+                    flex: 1,
+                    padding: "8px 10px",
+                    fontSize: 14,
+                    borderRadius: 6,
+                    border: "1px solid #d1d5db",
+                    outline: "none",
+                    color: "#111827",
+                  }}
+                />
+                <button
+                  onClick={sendMessage}
+                  disabled={isClosed}
+                  style={{
+                    padding: "8px 14px",
+                    background: "#2563eb",
+                    color: "#ffffff",
+                    border: "none",
+                    borderRadius: 6,
+                    cursor: isClosed ? "not-allowed" : "pointer",
+                    fontSize: 14,
+                    opacity: isClosed ? 0.6 : 1,
+                  }}
+                >
+                  Send
+                </button>
+              </div>
+            </>
+          )}
         </div>
       )}
-
-      <style jsx>{`
-        .chat-toggle {
-          position: fixed;
-          bottom: 20px;
-          right: 20px;
-          width: 64px;
-          height: 64px;
-          border-radius: 9999px;
-          background: linear-gradient(135deg, #111827, #1d4ed8);
-          color: #f8fafc;
-          font-size: 28px;
-          border: none;
-          box-shadow: 0 18px 40px rgba(0, 0, 0, 0.28);
-          cursor: pointer;
-          transition: transform 200ms ease, box-shadow 200ms ease, background 200ms ease;
-        }
-
-        .chat-toggle:hover {
-          transform: translateY(-2px) scale(1.02);
-          box-shadow: 0 24px 48px rgba(0, 0, 0, 0.32);
-          background: linear-gradient(135deg, #0f172a, #1e3a8a);
-        }
-
-        .chat-toggle:active {
-          transform: translateY(0);
-        }
-
-        .chat-panel {
-          position: fixed;
-          bottom: 100px;
-          right: 20px;
-          width: min(360px, calc(100vw - 32px));
-          height: 520px;
-          background: #0f172a;
-          color: #e5e7eb;
-          border-radius: 20px;
-          box-shadow: 0 30px 80px rgba(0, 0, 0, 0.36);
-          display: flex;
-          flex-direction: column;
-          overflow: hidden;
-          border: 1px solid rgba(255, 255, 255, 0.06);
-        }
-
-        .chat-header {
-          display: flex;
-          align-items: center;
-          justify-content: space-between;
-          padding: 16px 18px;
-          background: linear-gradient(135deg, rgba(46, 64, 108, 0.9), rgba(30, 64, 175, 0.75));
-          backdrop-filter: blur(8px);
-        }
-
-        .chat-identity {
-          display: flex;
-          align-items: center;
-          gap: 10px;
-        }
-
-        .avatar {
-          width: 38px;
-          height: 38px;
-          border-radius: 12px;
-          background: linear-gradient(135deg, #1f2937, #0ea5e9);
-          display: grid;
-          place-items: center;
-          font-weight: 700;
-          letter-spacing: 0.5px;
-          color: #e0f2fe;
-          box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08);
-        }
-
-        .title {
-          font-weight: 700;
-          font-size: 15px;
-        }
-
-        .status {
-          display: inline-flex;
-          align-items: center;
-          gap: 6px;
-          font-size: 13px;
-          letter-spacing: 0.2px;
-        }
-
-        .status-dot {
-          width: 8px;
-          height: 8px;
-          border-radius: 50%;
-          display: inline-block;
-          box-shadow: 0 0 0 4px rgba(255, 255, 255, 0.05);
-        }
-
-        .icon-btn {
-          width: 36px;
-          height: 36px;
-          border-radius: 12px;
-          background: rgba(15, 23, 42, 0.65);
-          color: #e5e7eb;
-          border: 1px solid rgba(255, 255, 255, 0.08);
-          cursor: pointer;
-          font-size: 18px;
-          transition: background 160ms ease, transform 160ms ease;
-        }
-
-        .icon-btn:hover {
-          background: rgba(255, 255, 255, 0.06);
-          transform: translateY(-1px);
-        }
-
-        .message-area {
-          flex: 1;
-          padding: 14px 16px 10px;
-          display: flex;
-          flex-direction: column;
-          gap: 10px;
-          overflow-y: auto;
-          background: radial-gradient(circle at 20% 20%, rgba(14, 165, 233, 0.05), transparent 25%),
-            radial-gradient(circle at 80% 0%, rgba(129, 140, 248, 0.08), transparent 30%),
-            #0b1220;
-        }
-
-        .message-area::-webkit-scrollbar {
-          width: 6px;
-        }
-
-        .message-area::-webkit-scrollbar-thumb {
-          background: rgba(255, 255, 255, 0.1);
-          border-radius: 999px;
-        }
-
-        .bubble {
-          max-width: 80%;
-          padding: 10px 12px;
-          border-radius: 14px;
-          font-size: 14px;
-          line-height: 1.4;
-          position: relative;
-          animation: pop 180ms ease;
-        }
-
-        .bubble-user {
-          margin-left: auto;
-          background: linear-gradient(135deg, #2563eb, #38bdf8);
-          color: #f8fafc;
-          box-shadow: 0 12px 30px rgba(37, 99, 235, 0.35);
-        }
-
-        .bubble-admin {
-          margin-right: auto;
-          background: rgba(255, 255, 255, 0.06);
-          border: 1px solid rgba(255, 255, 255, 0.06);
-          color: #e5e7eb;
-          box-shadow: 0 10px 22px rgba(0, 0, 0, 0.25);
-        }
-
-        .empty-state {
-          margin: auto;
-          text-align: center;
-          color: #cbd5e1;
-          padding: 24px;
-          background: rgba(255, 255, 255, 0.03);
-          border: 1px dashed rgba(255, 255, 255, 0.08);
-          border-radius: 16px;
-        }
-
-        .empty-title {
-          font-weight: 700;
-          margin-bottom: 6px;
-        }
-
-        .empty-body {
-          font-size: 14px;
-          color: #94a3b8;
-        }
-
-        .quick-replies {
-          display: flex;
-          gap: 8px;
-          padding: 8px 14px;
-          overflow-x: auto;
-          background: rgba(255, 255, 255, 0.02);
-          border-top: 1px solid rgba(255, 255, 255, 0.04);
-        }
-
-        .chip {
-          border: 1px solid rgba(255, 255, 255, 0.08);
-          background: rgba(15, 23, 42, 0.7);
-          color: #e2e8f0;
-          border-radius: 999px;
-          padding: 8px 12px;
-          font-size: 13px;
-          cursor: pointer;
-          transition: border 150ms ease, transform 150ms ease, background 150ms ease;
-          white-space: nowrap;
-        }
-
-        .chip:hover {
-          border-color: rgba(56, 189, 248, 0.6);
-          transform: translateY(-1px);
-          background: rgba(56, 189, 248, 0.08);
-        }
-
-        .input-row {
-          display: flex;
-          align-items: center;
-          gap: 10px;
-          padding: 12px 14px 14px;
-          background: rgba(15, 23, 42, 0.8);
-          border-top: 1px solid rgba(255, 255, 255, 0.06);
-        }
-
-        .input-row input {
-          flex: 1;
-          background: rgba(255, 255, 255, 0.04);
-          border: 1px solid rgba(255, 255, 255, 0.08);
-          border-radius: 12px;
-          padding: 11px 12px;
-          color: #e5e7eb;
-          font-size: 14px;
-          outline: none;
-          transition: border 160ms ease, box-shadow 160ms ease;
-        }
-
-        .input-row input:focus {
-          border-color: rgba(56, 189, 248, 0.8);
-          box-shadow: 0 0 0 2px rgba(56, 189, 248, 0.15);
-        }
-
-        .input-row input::placeholder {
-          color: #94a3b8;
-        }
-
-        .send-btn {
-          min-width: 76px;
-          background: linear-gradient(135deg, #0ea5e9, #2563eb);
-          border: none;
-          color: #f8fafc;
-          border-radius: 12px;
-          padding: 11px 14px;
-          font-weight: 700;
-          cursor: pointer;
-          transition: transform 150ms ease, box-shadow 150ms ease, opacity 150ms ease;
-          box-shadow: 0 12px 30px rgba(14, 165, 233, 0.35);
-        }
-
-        .send-btn:hover:not(:disabled) {
-          transform: translateY(-1px);
-          box-shadow: 0 16px 36px rgba(14, 165, 233, 0.45);
-        }
-
-        .send-btn:disabled {
-          opacity: 0.6;
-          cursor: not-allowed;
-          box-shadow: none;
-        }
-
-        @keyframes pop {
-          0% {
-            transform: translateY(6px) scale(0.98);
-            opacity: 0;
-          }
-          100% {
-            transform: translateY(0) scale(1);
-            opacity: 1;
-          }
-        }
-
-        @media (max-width: 520px) {
-          .chat-panel {
-            right: 12px;
-            width: calc(100vw - 24px);
-            height: 70vh;
-            bottom: 96px;
-          }
-
-          .chat-toggle {
-            right: 16px;
-          }
-        }
-      `}</style>
     </>
   );
 }
