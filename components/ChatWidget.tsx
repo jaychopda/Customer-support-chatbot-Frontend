@@ -2,13 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { socket } from "../lib/socket";
-
-type ChatStatus = "ACTIVE" | "CLOSED" | "IDLE";
-
-interface Message {
-  content: string;
-  sender: "USER" | "ADMIN";
-}
+import type { ChatStatus, Message, Chat } from "../types/chat";
 
 const API_BASE = "http://localhost:5000";
 const CHAT_COOKIE = "chat_session_id";
@@ -44,6 +38,7 @@ export default function ChatWidget() {
   const [userName, setUserName] = useState("");
   const [nameDraft, setNameDraft] = useState("");
   const [loading, setLoading] = useState(false);
+  const [userId, setUserId] = useState<string | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
 
   /* ---------------- RESTORE SESSION ---------------- */
@@ -78,37 +73,63 @@ export default function ChatWidget() {
 
       setMessages((prev) => {
         const last = prev[prev.length - 1];
-        // Drop exact duplicate (same sender + content)
-        if (last && last.content === data.message.content && last.sender === data.message.sender) {
+        if (last && last.id === data.message.id) {
           return prev;
         }
         return [...prev, data.message];
       });
     };
 
-    const handleClosed = () => setChatStatus("CLOSED");
-    const handleError = (payload: any) => console.warn("chat-error", payload);
+    const handleClosed = () => {
+      setChatStatus("CLOSED");
+    };
 
-    // Ensure only one handler of each kind is attached
+    const handleClosedByAdmin = (data: { chatId: string; reason: string; message: string }) => {
+      if (data.chatId === chatId) {
+        setChatStatus("CLOSED");
+        alert(`This chat has been closed by an administrator.\nReason: ${data.reason || "Not specified"}`);
+      }
+    };
+
+    const handleUserBanned = (payload: { message: string }) => {
+      alert(payload.message || "You are banned from sending messages");
+    };
+
+    const handleError = (payload: any) => {
+      console.warn("chat-error", payload);
+      alert(payload.message || "An error occurred");
+    };
+
     socket.off("receive-message");
     socket.off("chat-closed");
+    socket.off("chat-closed-by-admin");
+    socket.off("user-banned");
     socket.off("chat-error");
 
     socket.on("receive-message", handleReceive);
     socket.on("chat-closed", handleClosed);
+    socket.on("chat-closed-by-admin", handleClosedByAdmin);
+    socket.on("user-banned", handleUserBanned);
     socket.on("chat-error", handleError);
 
     return () => {
       socket.off("receive-message", handleReceive);
       socket.off("chat-closed", handleClosed);
+      socket.off("chat-closed-by-admin", handleClosedByAdmin);
+      socket.off("user-banned", handleUserBanned);
       socket.off("chat-error", handleError);
     };
   }, [chatId]);
 
   /* ---------------- AUTO SCROLL ---------------- */
   useEffect(() => {
-    if (scrollRef.current) {
-      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+    if (scrollRef.current && open) {
+      setTimeout(() => {
+        scrollRef.current?.scrollTo({
+          top: scrollRef.current.scrollHeight,
+          behavior: "smooth",
+        });
+      }, 100);
     }
   }, [messages, open]);
 
@@ -118,12 +139,14 @@ export default function ChatWidget() {
       const res = await fetch(`${API_BASE}/chat/${id}`);
       if (!res.ok) throw new Error("Chat not found");
       const data = await res.json();
-      setChatId(data.chat.id);
-      setChatStatus(data.chat.status ?? "ACTIVE");
-      setUserName(data.chat.user?.name || "");
+      const chat: Chat = data.chat;
+      setChatId(chat.id);
+      setChatStatus(chat.status ?? "ACTIVE");
+      setUserName(chat.user?.name || "");
+      setUserId(chat.userId);
       setMessages(data.messages || []);
-      writeCookie(CHAT_COOKIE, data.chat.id);
-      socket.emit("join-chat", data.chat.id);
+      writeCookie(CHAT_COOKIE, chat.id);
+      socket.emit("join-chat", chat.id);
     } catch (err) {
       console.error(err);
       clearCookie(CHAT_COOKIE);
@@ -143,27 +166,28 @@ export default function ChatWidget() {
       });
 
       const data = await res.json();
-      const newId = data?.chat?.id;
-      if (!newId) throw new Error("Unable to start chat");
+      const chat: Chat = data?.chat;
+      if (!chat?.id) throw new Error("Unable to start chat");
 
-      setChatId(newId);
+      setChatId(chat.id);
+      setUserId(chat.userId);
       setUserName(nameDraft);
       setChatStatus("ACTIVE");
       setMessages([]);
-      writeCookie(CHAT_COOKIE, newId);
-      socket.emit("join-chat", newId);
+      writeCookie(CHAT_COOKIE, chat.id);
+      socket.emit("join-chat", chat.id);
       setNameDraft("");
     } catch (err) {
       console.error(err);
+      alert("Failed to start chat. Please try again.");
     } finally {
       setLoading(false);
     }
   };
 
-  /* ---------------- SEND MESSAGE ---------------- */
   const sendMessage = () => {
     if (!input.trim()) return;
-    if (!chatId) {
+    if (!chatId || !userId) {
       setOpen(true);
       setChatStatus("IDLE");
       return;
@@ -171,7 +195,8 @@ export default function ChatWidget() {
 
     socket.emit("send-message", {
       chatId,
-      content: input,
+      content: input.trim(),
+      userId,
       sender: "USER",
     });
 
@@ -187,6 +212,7 @@ export default function ChatWidget() {
   const startNewChat = () => {
     clearCookie(CHAT_COOKIE);
     setChatId(null);
+    setUserId(null);
     setMessages([]);
     setChatStatus("IDLE" as ChatStatus);
     setUserName("");
@@ -205,15 +231,30 @@ export default function ChatWidget() {
           position: "fixed",
           bottom: 20,
           right: 20,
-          width: 60,
-          height: 60,
+          width: 64,
+          height: 64,
           borderRadius: "50%",
-          background: "#2563eb",
+          background: status === "online" 
+            ? "linear-gradient(135deg, #0ea5e9, #2563eb)" 
+            : "linear-gradient(135deg, #64748b, #475569)",
           color: "#ffffff",
-          fontSize: 24,
+          fontSize: 28,
           border: "none",
           cursor: "pointer",
-          boxShadow: "0 8px 25px rgba(0,0,0,0.3)",
+          boxShadow: status === "online"
+            ? "0 12px 32px rgba(14, 165, 233, 0.4)"
+            : "0 8px 20px rgba(0,0,0,0.2)",
+          transition: "all 0.3s ease",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          zIndex: 1000,
+        }}
+        onMouseEnter={(e) => {
+          e.currentTarget.style.transform = "scale(1.1)";
+        }}
+        onMouseLeave={(e) => {
+          e.currentTarget.style.transform = "scale(1)";
         }}
       >
         {open ? "×" : "💬"}
@@ -225,30 +266,46 @@ export default function ChatWidget() {
             position: "fixed",
             bottom: 90,
             right: 20,
-            width: 360,
-            height: 500,
-            background: "#ffffff",
-            borderRadius: 12,
+            width: 380,
+            height: 600,
+            maxWidth: "calc(100vw - 40px)",
+            maxHeight: "calc(100vh - 120px)",
+            background: "linear-gradient(135deg, #ffffff 0%, #f8fafc 100%)",
+            borderRadius: 16,
             display: "flex",
             flexDirection: "column",
-            boxShadow: "0 15px 45px rgba(0,0,0,0.35)",
+            boxShadow: "0 20px 60px rgba(0,0,0,0.3)",
             overflow: "hidden",
-            fontFamily: "Arial, sans-serif",
+            fontFamily: '"Manrope", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
+            zIndex: 999,
+            animation: "slideUp 0.3s ease",
           }}
         >
           <div
             style={{
-              padding: "12px 14px",
-              background: "#1e40af",
+              padding: "16px 18px",
+              background: "linear-gradient(135deg, #1e40af 0%, #3b82f6 100%)",
               color: "#ffffff",
-              fontSize: 15,
-              fontWeight: 600,
+              fontSize: 16,
+              fontWeight: 700,
               display: "flex",
               justifyContent: "space-between",
               alignItems: "center",
+              boxShadow: "0 4px 12px rgba(30, 64, 175, 0.3)",
             }}
           >
-            <span>Customer Support ({status})</span>
+            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              <span
+                style={{
+                  width: 8,
+                  height: 8,
+                  borderRadius: "50%",
+                  background: status === "online" ? "#22c55e" : "#ef4444",
+                  boxShadow: status === "online" ? "0 0 8px #22c55e" : "none",
+                }}
+              />
+              <span>Customer Support</span>
+            </div>
             <div style={{ display: "flex", gap: 8 }}>
               {isActive && (
                 <button
@@ -337,14 +394,16 @@ export default function ChatWidget() {
             <>
               <div
                 ref={scrollRef}
+                ref={scrollRef}
                 style={{
                   flex: 1,
-                  padding: 12,
+                  padding: 16,
                   overflowY: "auto",
-                  background: "#f3f4f6",
+                  background: "linear-gradient(180deg, #f8fafc 0%, #f1f5f9 100%)",
+                  scrollBehavior: "smooth",
                 }}
               >
-                {messages.length === 0 && !loading && (
+                {loading && (
                   <div
                     style={{
                       textAlign: "center",
@@ -353,31 +412,55 @@ export default function ChatWidget() {
                       fontSize: 14,
                     }}
                   >
-                    👋 {userName ? `${userName}, ` : ""}how can we help you today?
+                    Loading...
+                  </div>
+                )}
+                {messages.length === 0 && !loading && (
+                  <div
+                    style={{
+                      textAlign: "center",
+                      color: "#64748b",
+                      marginTop: 60,
+                      fontSize: 15,
+                      lineHeight: 1.6,
+                    }}
+                  >
+                    <div style={{ fontSize: 48, marginBottom: 16 }}>👋</div>
+                    <div style={{ fontWeight: 600, marginBottom: 8 }}>
+                      {userName ? `Hi ${userName}!` : "Hello!"}
+                    </div>
+                    <div>How can we help you today?</div>
                   </div>
                 )}
 
-                {messages.map((msg, i) => (
+                {messages.map((msg) => (
                   <div
-                    key={i}
+                    key={msg.id}
                     style={{
                       display: "flex",
                       justifyContent:
                         msg.sender === "USER" ? "flex-end" : "flex-start",
-                      marginBottom: 8,
+                      marginBottom: 12,
+                      animation: "fadeIn 0.3s ease",
                     }}
                   >
                     <div
                       style={{
                         maxWidth: "75%",
-                        padding: "8px 12px",
-                        borderRadius: 8,
+                        padding: "10px 14px",
+                        borderRadius: msg.sender === "USER" ? "16px 16px 4px 16px" : "16px 16px 16px 4px",
                         fontSize: 14,
-                        lineHeight: 1.4,
+                        lineHeight: 1.5,
                         background:
-                          msg.sender === "USER" ? "#2563eb" : "#e5e7eb",
-                        color:
-                          msg.sender === "USER" ? "#ffffff" : "#111827",
+                          msg.sender === "USER"
+                            ? "linear-gradient(135deg, #2563eb, #3b82f6)"
+                            : "#ffffff",
+                        color: msg.sender === "USER" ? "#ffffff" : "#1e293b",
+                        boxShadow:
+                          msg.sender === "USER"
+                            ? "0 4px 12px rgba(37, 99, 235, 0.3)"
+                            : "0 2px 8px rgba(0,0,0,0.1)",
+                        border: msg.sender === "USER" ? "none" : "1px solid #e2e8f0",
                       }}
                     >
                       {msg.content}
@@ -388,44 +471,76 @@ export default function ChatWidget() {
 
               <div
                 style={{
-                  padding: 10,
+                  padding: "12px 14px",
                   display: "flex",
-                  gap: 8,
-                  borderTop: "1px solid #e5e7eb",
+                  gap: 10,
+                  borderTop: "1px solid #e2e8f0",
                   background: "#ffffff",
                 }}
               >
                 <input
                   value={input}
                   onChange={(e) => setInput(e.target.value)}
-                  onKeyDown={(e) => e.key === "Enter" && sendMessage()}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" && !e.shiftKey) {
+                      e.preventDefault();
+                      sendMessage();
+                    }
+                  }}
                   placeholder={isClosed ? "Chat closed" : "Type a message..."}
-                  disabled={isClosed}
+                  disabled={isClosed || loading}
                   style={{
                     flex: 1,
-                    padding: "8px 10px",
+                    padding: "10px 14px",
                     fontSize: 14,
-                    borderRadius: 6,
-                    border: "1px solid #d1d5db",
+                    borderRadius: 12,
+                    border: "1px solid #e2e8f0",
                     outline: "none",
-                    color: "#111827",
+                    color: "#1e293b",
+                    transition: "all 0.2s ease",
+                    background: isClosed ? "#f1f5f9" : "#ffffff",
+                  }}
+                  onFocus={(e) => {
+                    if (!isClosed) {
+                      e.currentTarget.style.borderColor = "#3b82f6";
+                      e.currentTarget.style.boxShadow = "0 0 0 3px rgba(59, 130, 246, 0.1)";
+                    }
+                  }}
+                  onBlur={(e) => {
+                    e.currentTarget.style.borderColor = "#e2e8f0";
+                    e.currentTarget.style.boxShadow = "none";
                   }}
                 />
                 <button
                   onClick={sendMessage}
-                  disabled={isClosed}
+                  disabled={isClosed || loading || !input.trim()}
                   style={{
-                    padding: "8px 14px",
-                    background: "#2563eb",
+                    padding: "10px 20px",
+                    background: isClosed || loading || !input.trim()
+                      ? "#cbd5e1"
+                      : "linear-gradient(135deg, #2563eb, #3b82f6)",
                     color: "#ffffff",
                     border: "none",
-                    borderRadius: 6,
-                    cursor: isClosed ? "not-allowed" : "pointer",
+                    borderRadius: 12,
+                    cursor: isClosed || loading || !input.trim() ? "not-allowed" : "pointer",
                     fontSize: 14,
-                    opacity: isClosed ? 0.6 : 1,
+                    fontWeight: 600,
+                    transition: "all 0.2s ease",
+                    boxShadow: isClosed || loading || !input.trim()
+                      ? "none"
+                      : "0 4px 12px rgba(37, 99, 235, 0.3)",
+                  }}
+                  onMouseEnter={(e) => {
+                    if (!isClosed && !loading && input.trim()) {
+                      e.currentTarget.style.transform = "translateY(-1px)";
+                      e.currentTarget.style.boxShadow = "0 6px 16px rgba(37, 99, 235, 0.4)";
+                    }
+                  }}
+                  onMouseLeave={(e) => {
+                    e.currentTarget.style.transform = "translateY(0)";
                   }}
                 >
-                  Send
+                  {loading ? "..." : "Send"}
                 </button>
               </div>
             </>
