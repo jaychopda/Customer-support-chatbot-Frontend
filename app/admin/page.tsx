@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
+import { useRouter } from "next/navigation";
 import { socket } from "../../lib/socket";
 import type { Chat, Message, ChatStatus } from "../../types/chat";
 
@@ -38,6 +39,7 @@ interface Analytics {
 }
 
 export default function AdminPanel() {
+  const router = useRouter();
   const [view, setView] = useState<View>("chats");
   const [activeChats, setActiveChats] = useState<Chat[]>([]);
   const [closedChats, setClosedChats] = useState<Chat[]>([]);
@@ -57,11 +59,90 @@ export default function AdminPanel() {
   const [closeReason, setCloseReason] = useState("");
   const [localSettings, setLocalSettings] = useState<Settings | null>(null);
   const [settingsChanged, setSettingsChanged] = useState(false);
+  const [adminInfo, setAdminInfo] = useState<any>(null);
+  const [isAuthenticated, setIsAuthenticated] = useState(false);
+  const [isRedirecting, setIsRedirecting] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
   const API_BASE = "http://localhost:5000/admin";
 
   useEffect(() => {
+    let mounted = true;
+    let redirecting = false;
+    
+    const checkAuth = async () => {
+      if (redirecting) return;
+      
+      try {
+        const res = await fetch("http://localhost:5000/auth/me", {
+          credentials: "include",
+        });
+        if (!mounted) return;
+        
+        if (res.ok) {
+          try {
+            const data = await res.json();
+            if (data.admin) {
+              setAdminInfo(data.admin);
+              setIsAuthenticated(true);
+            } else {
+              if (!redirecting) {
+                redirecting = true;
+                setIsRedirecting(true);
+                setIsAuthenticated(false);
+                router.push("/admin/login");
+              }
+            }
+          } catch (parseError) {
+            console.error("Failed to parse auth response:", parseError);
+            if (!redirecting) {
+              redirecting = true;
+              setIsRedirecting(true);
+              setIsAuthenticated(false);
+              router.push("/admin/login");
+            }
+          }
+        } else {
+          if (!redirecting) {
+            redirecting = true;
+            setIsRedirecting(true);
+            setIsAuthenticated(false);
+            router.push("/admin/login");
+          }
+        }
+      } catch (error) {
+        console.error("Auth check failed:", error);
+        if (mounted && !redirecting) {
+          redirecting = true;
+          setIsRedirecting(true);
+          setIsAuthenticated(false);
+          router.push("/admin/login");
+        }
+      }
+    };
+    
+    checkAuth();
+    
+    return () => {
+      mounted = false;
+    };
+  }, [router]);
+
+  const handleLogout = async () => {
+    try {
+      await fetch("http://localhost:5000/auth/logout", {
+        method: "POST",
+        credentials: "include",
+      });
+      router.push("/admin/login");
+    } catch (error) {
+      console.error("Logout failed:", error);
+    }
+  };
+
+  useEffect(() => {
+    if (!isAuthenticated) return;
+    
     const handleConnect = () => setStatus("online");
     const handleDisconnect = () => setStatus("offline");
     
@@ -73,7 +154,7 @@ export default function AdminPanel() {
       socket.off("connect", handleConnect);
       socket.off("disconnect", handleDisconnect);
     };
-  }, []);
+  }, [isAuthenticated]);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -95,49 +176,155 @@ export default function AdminPanel() {
       try {
         if (view === "chats") {
           const [activeRes, closedRes, analyticsRes] = await Promise.all([
-            fetch(`${API_BASE}/chats?status=ACTIVE&array=true`),
-            fetch(`${API_BASE}/chats?status=CLOSED&array=true`),
-            fetch(`${API_BASE}/analytics`),
+            fetch(`${API_BASE}/chats?status=ACTIVE&array=true`, { credentials: "include" }),
+            fetch(`${API_BASE}/chats?status=CLOSED&array=true`, { credentials: "include" }),
+            fetch(`${API_BASE}/analytics`, { credentials: "include" }),
           ]);
 
-          const [activeData, closedData, analyticsData] = await Promise.all([
-            activeRes.json(),
-            closedRes.json(),
-            analyticsRes.json(),
-          ]);
+          if (activeRes.status === 401 || closedRes.status === 401 || analyticsRes.status === 401) {
+            if (!isRedirecting) {
+              setIsRedirecting(true);
+              setIsAuthenticated(false);
+              router.push("/admin/login");
+            }
+            return;
+          }
 
-          setActiveChats((activeData.data || activeData).map(mapChat));
-          setClosedChats((closedData.data || closedData).map(mapChat));
-          setAnalytics(analyticsData);
+          if (!activeRes.ok || !closedRes.ok || !analyticsRes.ok) {
+            const errorText = await activeRes.text().catch(() => "");
+            console.error("Failed to fetch data:", { 
+              activeRes: activeRes.status, 
+              closedRes: closedRes.status, 
+              analyticsRes: analyticsRes.status,
+              error: errorText
+            });
+            return;
+          }
+
+          let activeData, closedData, analyticsData;
+          try {
+            [activeData, closedData, analyticsData] = await Promise.all([
+              activeRes.json(),
+              closedRes.json(),
+              analyticsRes.json(),
+            ]);
+          } catch (parseError) {
+            console.error("Failed to parse JSON:", parseError);
+            return;
+          }
+
+          if (activeData) {
+            setActiveChats((activeData.data || activeData || []).map(mapChat));
+          }
+          if (closedData) {
+            setClosedChats((closedData.data || closedData || []).map(mapChat));
+          }
+          if (analyticsData) {
+            setAnalytics(analyticsData);
+          }
         } else if (view === "analytics") {
-          const res = await fetch(`${API_BASE}/analytics`);
-          const data = await res.json();
-          setAnalytics(data);
+          const res = await fetch(`${API_BASE}/analytics`, { credentials: "include" });
+          if (res.status === 401) {
+            if (!isRedirecting) {
+              setIsRedirecting(true);
+              setIsAuthenticated(false);
+              router.push("/admin/login");
+            }
+            return;
+          }
+          if (!res.ok) {
+            console.error("Failed to fetch analytics:", res.status);
+            return;
+          }
+          try {
+            const data = await res.json();
+            if (data) setAnalytics(data);
+          } catch (error) {
+            console.error("Failed to parse analytics JSON:", error);
+          }
         } else if (view === "users") {
-          const res = await fetch(`${API_BASE}/users`);
-          const data = await res.json();
-          setUsers(data.data || []);
+          const res = await fetch(`${API_BASE}/users`, { credentials: "include" });
+          if (res.status === 401) {
+            if (!isRedirecting) {
+              setIsRedirecting(true);
+              setIsAuthenticated(false);
+              router.push("/admin/login");
+            }
+            return;
+          }
+          if (!res.ok) {
+            console.error("Failed to fetch users:", res.status);
+            return;
+          }
+          try {
+            const data = await res.json();
+            setUsers(data.data || []);
+          } catch (error) {
+            console.error("Failed to parse users JSON:", error);
+          }
         } else if (view === "settings") {
-          const res = await fetch(`${API_BASE}/settings`);
-          const data = await res.json();
-          setSettings(data);
-          setLocalSettings(data);
-          setSettingsChanged(false);
+          const res = await fetch(`${API_BASE}/settings`, { credentials: "include" });
+          if (res.status === 401) {
+            if (!isRedirecting) {
+              setIsRedirecting(true);
+              setIsAuthenticated(false);
+              router.push("/admin/login");
+            }
+            return;
+          }
+          if (!res.ok) {
+            console.error("Failed to fetch settings:", res.status);
+            return;
+          }
+          try {
+            const data = await res.json();
+            if (data) {
+              setSettings(data);
+              setLocalSettings(data);
+              setSettingsChanged(false);
+            }
+          } catch (error) {
+            console.error("Failed to parse settings JSON:", error);
+          }
         }
 
         if (!adminUserId) {
           try {
-            let adminUserRes = await fetch(`${API_BASE}/users?role=ADMIN`);
-            let adminUserData = await adminUserRes.json();
+            let adminUserRes = await fetch(`${API_BASE}/users?role=ADMIN`, { credentials: "include" });
+            if (adminUserRes.status === 401) {
+              if (!isRedirecting) {
+                setIsRedirecting(true);
+                setIsAuthenticated(false);
+                router.push("/admin/login");
+              }
+              return;
+            }
+            if (!adminUserRes.ok) {
+              console.error("Failed to fetch admin users:", adminUserRes.status);
+              return;
+            }
+            let adminUserData;
+            try {
+              adminUserData = await adminUserRes.json();
+            } catch (error) {
+              console.error("Failed to parse admin users JSON:", error);
+              return;
+            }
             let adminUsers = adminUserData.data || [];
             
             if (adminUsers.length === 0) {
-              adminUserRes = await fetch(`${API_BASE}/users/ensure-admin`);
-              adminUserData = await adminUserRes.json();
-              if (adminUserData.admin?.id) {
-                setAdminUserId(adminUserData.admin.id);
+              adminUserRes = await fetch(`${API_BASE}/users/ensure-admin`, { credentials: "include" });
+              if (adminUserRes.ok) {
+                try {
+                  adminUserData = await adminUserRes.json();
+                  if (adminUserData.admin?.id) {
+                    setAdminUserId(adminUserData.admin.id);
+                  }
+                } catch (error) {
+                  console.error("Failed to parse ensure-admin JSON:", error);
+                }
               }
-            } else if (adminUsers[0].id) {
+            } else if (adminUsers[0]?.id) {
               setAdminUserId(adminUsers[0].id);
             }
           } catch (error) {
@@ -146,20 +333,25 @@ export default function AdminPanel() {
         }
       } catch (error) {
         console.error("Failed to load data:", error);
+        if (error instanceof Error && error.message.includes("401")) {
+          router.push("/admin/login");
+        }
       }
     };
 
-    load();
-    const interval = setInterval(load, 30000);
-    return () => clearInterval(interval);
-  }, [view, adminUserId]);
+    if (isAuthenticated) {
+      load();
+      const interval = setInterval(load, 30000);
+      return () => clearInterval(interval);
+    }
+  }, [view, adminUserId, isAuthenticated]);
 
   const openChat = async (chat: Chat) => {
     setActiveChat(chat);
     socket.emit("join-chat", chat.id);
 
     try {
-      const res = await fetch(`${API_BASE}/chats/${chat.id}/messages`);
+      const res = await fetch(`${API_BASE}/chats/${chat.id}/messages`, { credentials: "include" });
       const data = await res.json();
       setMessages(data.data || data);
     } catch (error) {
@@ -248,6 +440,7 @@ export default function AdminPanel() {
       await fetch(`${API_BASE}/chats/${activeChat.id}/close`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
+        credentials: "include",
         body: JSON.stringify({ reason: closeReason }),
       });
 
@@ -269,6 +462,7 @@ export default function AdminPanel() {
       await fetch(`${API_BASE}/chats/${activeChat.id}/reopen`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
+        credentials: "include",
         body: JSON.stringify({ reason: "Reopened by admin" }),
       });
 
@@ -289,6 +483,7 @@ export default function AdminPanel() {
       await fetch(`${API_BASE}/chats/${activeChat.id}/notes`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
+        credentials: "include",
         body: JSON.stringify({ notes: notesText }),
       });
 
@@ -305,7 +500,7 @@ export default function AdminPanel() {
     if (!searchQuery.trim() || searchQuery.length < 2) return;
 
     try {
-      const res = await fetch(`${API_BASE}/search?query=${encodeURIComponent(searchQuery)}`);
+      const res = await fetch(`${API_BASE}/search?query=${encodeURIComponent(searchQuery)}`, { credentials: "include" });
       const data = await res.json();
       setSearchResults(data);
     } catch (error) {
@@ -318,6 +513,7 @@ export default function AdminPanel() {
       const res = await fetch(`${API_BASE}/settings`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
+        credentials: "include",
         body: JSON.stringify(updates),
       });
       const data = await res.json();
@@ -361,6 +557,7 @@ export default function AdminPanel() {
       await fetch(`${API_BASE}/users/${userId}/status`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
+        credentials: "include",
         body: JSON.stringify({ isBanned }),
       });
       setUsers((prev) => prev.map((u) => u.id === userId ? { ...u, isBanned } : u));
@@ -375,6 +572,7 @@ export default function AdminPanel() {
       await fetch(`${API_BASE}/users/${userId}/role`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
+        credentials: "include",
         body: JSON.stringify({ role }),
       });
       setUsers((prev) => prev.map((u) => u.id === userId ? { ...u, role } : u));
@@ -386,6 +584,20 @@ export default function AdminPanel() {
   };
 
   const statusColor = status === "online" ? "#16a34a" : status === "connecting" ? "#f59e0b" : "#ef4444";
+
+  if (!isAuthenticated) {
+    return (
+      <div style={{ 
+        display: "flex", 
+        alignItems: "center", 
+        justifyContent: "center", 
+        height: "100vh",
+        color: "#e2e8f0"
+      }}>
+        Loading...
+      </div>
+    );
+  }
 
   return (
     <div className="admin-layout">
@@ -456,6 +668,31 @@ export default function AdminPanel() {
                 <strong style={{ marginLeft: "auto" }}>{analytics.overview.totalUsers}</strong>
               </div>
             </>
+          )}
+          {adminInfo && (
+            <div className="admin-status-row" style={{ marginTop: 16, paddingTop: 16, borderTop: "1px solid rgba(255, 255, 255, 0.1)" }}>
+              <span style={{ fontSize: 12, color: "#94a3b8" }}>Logged in as:</span>
+              <div style={{ marginTop: 4, fontSize: 13, fontWeight: 600, color: "#e2e8f0" }}>
+                {adminInfo.name}
+              </div>
+              <button
+                onClick={handleLogout}
+                style={{
+                  marginTop: 12,
+                  width: "100%",
+                  padding: "8px",
+                  background: "rgba(239, 68, 68, 0.1)",
+                  border: "1px solid rgba(239, 68, 68, 0.3)",
+                  borderRadius: "8px",
+                  color: "#fca5a5",
+                  cursor: "pointer",
+                  fontSize: 12,
+                  fontWeight: 600,
+                }}
+              >
+                Logout
+              </button>
+            </div>
           )}
         </div>
       </aside>
